@@ -22,6 +22,7 @@ from ultralytics import YOLO
 import torchvision.transforms as T
 from collections import defaultdict
 from datetime import datetime
+import argparse
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -32,8 +33,22 @@ class AccurateMetricsEvaluator:
         print("🚀 Accurate Model Metrics Evaluator")
         print("=" * 60)
         
-        # Get dataset path from user
-        self.data_dir = self.get_dataset_path()
+        # Parse CLI args
+        parser = argparse.ArgumentParser(description='Accurate model evaluation with GPU optimization')
+        parser.add_argument('--data-dir', type=str, default='', help='Path to VisDrone dataset root')
+        parser.add_argument('--batch-size', type=int, default=1, help='Batch size for inference where supported')
+        parser.add_argument('--device', type=str, default='auto', help='Device: auto|cuda|mps|cpu or cuda:0')
+        parser.add_argument('--half', action='store_true', help='Use float16 on CUDA where supported')
+        args, _ = parser.parse_known_args()
+        self.args = args
+        
+        # Device selection
+        self.device = self.select_device(args.device)
+        self.use_half = bool(args.half and self.device.type == 'cuda')
+        print(f"🖥️ Device: {self.device} | FP16: {self.use_half}")
+        
+        # Get dataset path from user or CLI
+        self.data_dir = self.get_dataset_path(args.data_dir)
         
         # Set up directories
         self.models_dir = Path("models")
@@ -78,35 +93,54 @@ class AccurateMetricsEvaluator:
         print(f"📁 Models directory: {self.models_dir}")
         print(f"📁 Results directory: {self.results_dir}")
 
-    def get_dataset_path(self) -> Path:
-        """Get dataset path from user input"""
+    def select_device(self, device_pref: str) -> torch.device:
+        """Select best available device based on preference."""
+        if device_pref != 'auto':
+            if device_pref.startswith('cuda') and torch.cuda.is_available():
+                return torch.device(device_pref)
+            if device_pref == 'mps' and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                return torch.device('mps')
+            if device_pref == 'cpu':
+                return torch.device('cpu')
+            print(f"⚠️ Requested device '{device_pref}' not available. Falling back to auto.")
+        
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            return torch.device('mps')
+        return torch.device('cpu')
+
+    def get_dataset_path(self, cli_path: str) -> Path:
+        """Get dataset path from CLI or user input"""
         print("\n📍 Dataset Location Setup")
+        if cli_path:
+            data_path = Path(cli_path)
+            if data_path.exists():
+                print(f"✅ Using dataset path from CLI: {data_path}")
+                return data_path
+            else:
+                print(f"❌ CLI path does not exist: {data_path}")
+        
         print("Please provide the path to your VisDrone dataset directory.")
         print("Example: /data/VisDrone2019Data or /Users/username/data/VisDrone")
         
         while True:
             path_input = input("\nEnter dataset path: ").strip()
-            
             if not path_input:
                 print("❌ Please enter a valid path")
                 continue
-                
             data_path = Path(path_input)
-            
             if not data_path.exists():
                 print(f"❌ Path does not exist: {data_path}")
                 continue
-            
-            # Check for required subdirectories
-            val_dir = data_path / "VisDrone2019-DET-test-dev"
+            val_dir = data_path / "VisDrone2019-DET-val"
             if not val_dir.exists():
-                print(f"❌ VisDrone2019-DET-test-dev not found in {data_path}")
+                print(f"❌ VisDrone2019-DET-val not found in {data_path}")
                 print("Available directories:")
                 for item in data_path.iterdir():
                     if item.is_dir():
                         print(f"  📁 {item.name}")
                 continue
-            
             print(f"✅ Valid dataset path: {data_path}")
             return data_path
 
@@ -125,12 +159,17 @@ class AccurateMetricsEvaluator:
                 try:
                     print(f"Loading {name}...")
                     model = YOLO(str(model_path))
+                    # Set device for YOLO
+                    try:
+                        model.to(self.device)
+                    except Exception:
+                        pass
                     self.models[name] = {
                         'model': model,
                         'type': 'yolo',
                         'loaded': True
                     }
-                    print(f"✅ {name} loaded successfully")
+                    print(f"✅ {name} loaded successfully on {self.device}")
                 except Exception as e:
                     print(f"❌ Failed to load {name}: {e}")
 
@@ -144,14 +183,19 @@ class AccurateMetricsEvaluator:
                     model = torch.hub.load('facebookresearch/detr', 'detr_resnet50', pretrained=True)
                 else:
                     model = torch.hub.load('facebookresearch/detr', 'detr_resnet101', pretrained=True)
-                
                 model.eval()
+                model.to(self.device)
+                if self.use_half:
+                    try:
+                        model.half()
+                    except Exception:
+                        pass
                 self.models[name] = {
                     'model': model,
                     'type': 'detr',
                     'loaded': True
                 }
-                print(f"✅ {name} loaded successfully")
+                print(f"✅ {name} loaded successfully on {self.device} (half={self.use_half})")
             except Exception as e:
                 print(f"❌ Failed to load {name}: {e}")
 
@@ -367,27 +411,25 @@ class AccurateMetricsEvaluator:
     def run_yolo_inference(self, model, image_path: Path) -> List[Dict]:
         """Run YOLO inference and return detections"""
         try:
-            results = model(str(image_path), verbose=False)
-            
+            # ultralytics respects model.device; also pass device explicitly to be safe
+            results = model(str(image_path), verbose=False, device=str(self.device), half=self.use_half)
             detections = []
             if results and len(results) > 0:
                 result = results[0]
                 if result.boxes is not None:
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    scores = result.boxes.conf.cpu().numpy()
-                    classes = result.boxes.cls.cpu().numpy().astype(int)
-                    
+                    # Ensure tensors on CPU for numpy conversion
+                    boxes = result.boxes.xyxy.detach().cpu().numpy()
+                    scores = result.boxes.conf.detach().cpu().numpy()
+                    classes = result.boxes.cls.detach().cpu().numpy().astype(int)
                     for box, score, cls in zip(boxes, scores, classes):
-                        # Map YOLO classes to VisDrone classes if needed
-                        visdrone_class = cls + 1  # YOLO classes are 0-indexed, VisDrone are 1-indexed
+                        visdrone_class = cls + 1
                         if visdrone_class in self.visdrone_classes:
                             detections.append({
-                                'bbox': box.tolist(),
+                                'bbox': [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
                                 'confidence': float(score),
-                                'class': visdrone_class,
+                                'class': int(visdrone_class),
                                 'class_name': self.visdrone_classes[visdrone_class]
                             })
-            
             return detections
         except Exception as e:
             print(f"❌ YOLO inference error: {e}")
@@ -402,31 +444,35 @@ class AccurateMetricsEvaluator:
                 T.ToTensor(),
                 T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
-            
             img_tensor = transform(image).unsqueeze(0)
-            
+            img_tensor = img_tensor.to(self.device)
+            if self.use_half:
+                img_tensor = img_tensor.half()
             with torch.no_grad():
-                outputs = model(img_tensor)
-            
+                if self.device.type == 'cuda':
+                    with torch.autocast(device_type='cuda', enabled=True, dtype=torch.float16):
+                        outputs = model(img_tensor)
+                else:
+                    outputs = model(img_tensor)
             probas = outputs['pred_logits'].softmax(-1)[0, :, :-1]
             keep = probas.max(-1).values > 0.5
-            
             detections = []
             if keep.sum() > 0:
-                boxes = outputs['pred_boxes'][0, keep].cpu()
-                scores = probas[keep].max(-1).values.cpu()
-                classes = probas[keep].max(-1).indices.cpu()
-                
-                h, w = image.size[1], image.size[0]
+                boxes = outputs['pred_boxes'][0, keep]
+                scores = probas[keep].max(-1).values
+                classes = probas[keep].max(-1).indices
+                # Move to CPU for numpy ops
+                boxes = boxes.detach().cpu()
+                scores = scores.detach().cpu()
+                classes = classes.detach().cpu()
+                w, h = image.size
                 for box, score, cls in zip(boxes, scores, classes):
-                    # Only keep classes that map to VisDrone
                     if int(cls) in self.coco_to_visdrone:
                         cx, cy, bw, bh = box
                         x1 = (cx - bw/2) * w
                         y1 = (cy - bh/2) * h
                         x2 = (cx + bw/2) * w
                         y2 = (cy + bh/2) * h
-                        
                         visdrone_class = self.coco_to_visdrone[int(cls)]
                         detections.append({
                             'bbox': [float(x1), float(y1), float(x2), float(y2)],
@@ -434,7 +480,6 @@ class AccurateMetricsEvaluator:
                             'class': visdrone_class,
                             'class_name': self.visdrone_classes[visdrone_class]
                         })
-            
             return detections
         except Exception as e:
             print(f"❌ DETR inference error: {e}")
